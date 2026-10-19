@@ -668,6 +668,9 @@ fn resolving_a_thread_whose_worktree_is_already_gone_closes_its_workspace() {
     world.runner.on("worktree prune", ok(""));
     world.runner.on("workspace close", ok(r#"{"result":{}}"#));
     world.runner.on("rev-parse --verify --quiet refs/heads/hp/demo/t-0001-task", fail(1, ""));
+    // Another idle Space still open on the gone folder, as `herdr worktree open` leaves one.
+    *world.panes.borrow_mut() = format!("[{},{}]", pane_json("w2", "w2:t1", "w2:p1", &cwd), pane_json("w5", "w5:t1", "w5:p1", &cwd));
+    stub_spaces(&world, vec![linked_json("w2", "Task", "/repo", &cwd, false), linked_json("w5", "factory", "/repo", &cwd, false)]);
     let mut state = crate::steps::load_state(&project);
     state.prs.insert("t-0001".into(), crate::pr::Summary { state: "MERGED".into(), head_oid: "abc123".into(), ..Default::default() });
     crate::steps::save_state(&project, &state).unwrap();
@@ -676,9 +679,11 @@ fn resolving_a_thread_whose_worktree_is_already_gone_closes_its_workspace() {
     assert_eq!(world.runner.count("worktree remove"), 0);
     assert_eq!(world.runner.count("worktree prune"), 1);
     assert_eq!(world.runner.count("workspace close w2"), 1);
+    assert_eq!(world.runner.count("workspace close w5"), 1);
     assert!(thread::load(&project, "t-0001").unwrap().worktree_path.is_empty());
     let item = inbox::unhandled(&project).into_iter().find(|i| i.kind == "thread-state").unwrap();
     assert!(item.summary.contains("was already gone; its workspace closed"), "{}", item.summary);
+    assert!(item.summary.contains("also closed Space factory (w5) open on it"), "{}", item.summary);
     assert!(item.summary.contains("branch hp/demo/t-0001-task was already deleted"), "{}", item.summary);
     assert!(!item.summary.contains("kept"), "{}", item.summary);
 }
@@ -730,6 +735,184 @@ fn resolving_the_last_thread_closes_its_empty_repo_space() {
     assert_eq!(world.runner.count("workspace close w9"), 1);
     let item = inbox::unhandled(&project).into_iter().find(|i| i.kind == "space").unwrap();
     assert_eq!(item.summary, "closed empty Space repo (w9)");
+}
+
+/// A linked-worktree Space of `repo` on the checkout at `path`, as `workspace list` shows it.
+fn linked_json(id: &str, label: &str, repo: &str, path: &str, focused: bool) -> String {
+    format!(r#"{{"workspace_id":"{id}","label":"{label}","focused":{focused},"pane_count":1,"worktree":{{"repo_key":"{repo}/.git","checkout_path":"{path}","is_linked_worktree":true}}}}"#)
+}
+
+/// The primary Space of `repo`.
+fn primary_space_json(id: &str, repo: &str) -> String {
+    format!(r#"{{"workspace_id":"{id}","label":"repo","pane_count":1,"worktree":{{"repo_key":"{repo}/.git","checkout_path":"{repo}","is_linked_worktree":false}}}}"#)
+}
+
+/// The Spaces herdr lists, changeable mid-test, and the panes whose
+/// foreground process is not the shell.
+struct Spaces {
+    list: Rc<RefCell<Vec<String>>>,
+    busy: Rc<RefCell<Vec<String>>>,
+}
+
+/// Serves `workspace list` from `list`. `workspace close` and `worktree
+/// remove --workspace` drop the Space they name, as herdr does. Every pane
+/// is an idle shell unless named in `busy`.
+fn stub_spaces(world: &World, list: Vec<String>) -> Spaces {
+    let spaces = Spaces { list: Rc::new(RefCell::new(list)), busy: Rc::new(RefCell::new(Vec::new())) };
+    let list = spaces.list.clone();
+    world.runner.on_fn(|c| c.display().contains("workspace list"), move |_| Ok(ok(&format!(r#"{{"result":{{"workspaces":[{}]}}}}"#, list.borrow().join(",")))));
+    let list = spaces.list.clone();
+    world.runner.on_fn(
+        |c| c.display().contains("workspace close") || c.display().contains("worktree remove --workspace"),
+        move |c| {
+            let id = c.args.last().cloned().unwrap_or_default();
+            list.borrow_mut().retain(|w| !w.contains(&format!(r#""workspace_id":"{id}""#)));
+            Ok(ok(r#"{"result":{}}"#))
+        },
+    );
+    let busy = spaces.busy.clone();
+    world.runner.on_fn(
+        |c| c.display().contains("process-info"),
+        move |c| {
+            let pane = c.args.last().cloned().unwrap_or_default();
+            let group = if busy.borrow().contains(&pane) { 200 } else { 100 };
+            Ok(ok(&format!(r#"{{"result":{{"process_info":{{"pane_id":"{pane}","shell_pid":100,"foreground_process_group_id":{group},"foreground_processes":[{{"pid":{group},"name":"zsh"}}]}}}}}}"#)))
+        },
+    );
+    spaces
+}
+
+/// A local worktree thread in `w2` and the factory's Space `w5` (one idle
+/// shell, unfocused unless `focused`), both on the worktree.
+fn two_spaces_world(focused: bool) -> (World, Project, Spaces) {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    world.thread(&project, world.home.path(), |_| {});
+    let cwd = world.home.path().to_string_lossy().into_owned();
+    *world.panes.borrow_mut() = format!("[{},{},{}]", world.coordinator_pane(&project), pane_json("w2", "w2:t1", "w2:p1", &cwd), pane_json("w5", "w5:t1", "w5:p1", &cwd));
+    let spaces = stub_spaces(&world, vec![linked_json("w2", "Task", "/repo", &cwd, false), linked_json("w5", "factory", "/repo", &cwd, focused)]);
+    (world, project, spaces)
+}
+
+fn resolved_item(project: &Project) -> String {
+    inbox::unhandled(project).into_iter().find(|i| i.kind == "thread-state").unwrap().summary
+}
+
+#[test]
+fn resolving_a_thread_closes_another_idle_space_open_on_its_worktree() {
+    let (world, project, spaces) = two_spaces_world(false);
+    threads::resolve(&world.ctx(), "demo", "t-0001", &ResolveArgs::default()).unwrap();
+    assert_eq!(world.runner.count("workspace close w5"), 1);
+    assert_eq!(world.runner.count("worktree remove --workspace w2"), 1);
+    assert_eq!(world.runner.count("--group"), 0);
+    // Closed first: the worktree goes once nothing else is open on it.
+    let calls = world.runner.calls.borrow();
+    let at = |needle: &str| calls.iter().position(|c| c.display().contains(needle)).unwrap();
+    assert!(at("workspace close w5") < at("worktree remove --workspace w2"));
+    drop(calls);
+    assert!(thread::load(&project, "t-0001").unwrap().worktree_path.is_empty());
+    let item = resolved_item(&project);
+    assert!(item.contains("also closed Space factory (w5) open on it"), "{item}");
+    assert!(spaces.list.borrow().is_empty());
+}
+
+#[test]
+fn a_busy_space_on_the_worktree_keeps_it() {
+    for reason in ["busy shell", "agent", "focused"] {
+        let (world, project, spaces) = two_spaces_world(reason == "focused");
+        let cwd = world.home.path().to_string_lossy().into_owned();
+        match reason {
+            "busy shell" => spaces.busy.borrow_mut().push("w5:p1".into()),
+            "agent" => *world.agents.borrow_mut() = format!("[{}]", agent_json("w5", "w5:t1", "w5:p1", &cwd, "factory", "idle")),
+            _ => {}
+        }
+        threads::resolve(&world.ctx(), "demo", "t-0001", &ResolveArgs::default()).unwrap();
+        assert_eq!(world.runner.count("workspace close w5"), 0, "{reason}");
+        assert_eq!(world.runner.count("worktree remove"), 0, "{reason}");
+        let t = thread::load(&project, "t-0001").unwrap();
+        assert_eq!(t.status, Status::Resolved, "{reason}");
+        assert_eq!(t.worktree_path, cwd, "{reason}");
+        let item = resolved_item(&project);
+        assert!(item.contains(&format!("worktree kept at {cwd}: Space factory (w5) on it is still in use")), "{reason}: {item}");
+    }
+}
+
+#[test]
+fn a_space_on_the_worktree_removes_it_when_the_thread_has_none_open() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    world.thread(&project, world.home.path(), |_| {});
+    let cwd = world.home.path().to_string_lossy().into_owned();
+    *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w5", "w5:t1", "w5:p1", &cwd));
+    stub_spaces(&world, vec![linked_json("w5", "factory", "/repo", &cwd, false)]);
+    threads::resolve(&world.ctx(), "demo", "t-0001", &ResolveArgs::default()).unwrap();
+    assert_eq!(world.runner.count("worktree remove --workspace w5"), 1);
+    assert_eq!(world.runner.count("workspace close w5"), 0);
+    assert_eq!(world.runner.count("git -C /repo worktree remove"), 0);
+    assert!(thread::load(&project, "t-0001").unwrap().worktree_path.is_empty());
+}
+
+#[test]
+fn a_merged_thread_closes_every_space_on_its_worktree_and_then_the_repo_space() {
+    // `merged_world`, with herdr dropping each Space it closes.
+    let (world, project) = pr_world(MERGED_JSON);
+    set_agents(&world, &project, "idle");
+    let repo = world.home.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let repo = repo.to_string_lossy().into_owned();
+    let r = repo.clone();
+    thread::update(&project, "t-0001", |t| {
+        t.repo = r;
+        t.repo_workspace = "w9".into();
+    })
+    .unwrap();
+    let cwd = world.home.path().to_string_lossy().into_owned();
+    *world.panes.borrow_mut() = format!(
+        "[{},{},{},{}]",
+        world.coordinator_pane(&project),
+        pane_json("w2", "w2:t1", "w2:p1", &cwd),
+        pane_json("w5", "w5:t1", "w5:p1", &cwd),
+        pane_json("w9", "w9:t1", "w9:p1", &repo)
+    );
+    let spaces = stub_spaces(&world, vec![primary_space_json("w9", &repo), linked_json("w2", "Task", &repo, &cwd, false), linked_json("w5", "factory", &repo, &cwd, false)]);
+    world.runner.on("rev-parse --verify --quiet refs/heads/hp/demo/t-0001-task", ok("merged-head\n"));
+    world.runner.on("branch -D", ok(""));
+    let ctx = world.ctx();
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert_eq!(thread::load(&project, "t-0001").unwrap().status, Status::Open);
+    merged_seen_ago(&project, crate::steps::MERGE_GRACE_SECS);
+    ticker::tick_project(&ctx, &project).unwrap();
+    let t = thread::load(&project, "t-0001").unwrap();
+    assert_eq!((t.status, t.resolved_reason.as_str()), (Status::Resolved, "merged"));
+    assert!(t.worktree_path.is_empty());
+    assert_eq!(world.runner.count("workspace close w5"), 1);
+    assert_eq!(world.runner.count("worktree remove --workspace w2"), 1);
+    assert_eq!(world.runner.count("workspace close w9"), 1);
+    assert!(spaces.list.borrow().is_empty(), "{:?}", spaces.list.borrow());
+    let item = resolved_item(&project);
+    assert!(item.contains("also closed Space factory (w5) open on it"), "{item}");
+    assert_eq!(items_of(&project, "space")[0].summary, "closed empty Space repo (w9)");
+}
+
+#[test]
+fn sweep_closes_other_spaces_on_a_worktree_before_removing_it() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let text = std::fs::read_to_string(project.project_md()).unwrap();
+    std::fs::write(project.project_md(), text.replacen("repos = []", "[[repos]]\npath = \"/repo\"", 1)).unwrap();
+    world.runner.on("worktree list --porcelain", ok("worktree /repo\nbranch refs/heads/main\n\nworktree /wt/stray\nbranch refs/heads/hp/demo/t-0042-stray\n"));
+    world.runner.on("for-each-ref", ok(""));
+    // w2 is rooted at the worktree; w5, focused, has its shell in a subfolder.
+    *world.panes.borrow_mut() = format!("[{},{},{}]", world.coordinator_pane(&project), pane_json("w2", "w2:t1", "w2:p1", "/wt/stray"), pane_json("w5", "w5:t1", "w5:p1", "/wt/stray/src"));
+    let spaces = stub_spaces(&world, vec![linked_json("w2", "stray", "/repo", "/wt/stray", false), linked_json("w5", "factory", "/repo", "/wt/stray", true)]);
+    crate::sweep::run(&world.ctx(), "demo", false, true).unwrap();
+    assert_eq!(world.runner.count("workspace close w5"), 1);
+    assert_eq!(world.runner.count("worktree remove --workspace w2"), 1);
+    let calls = world.runner.calls.borrow();
+    let at = |needle: &str| calls.iter().position(|c| c.display().contains(needle)).unwrap();
+    assert!(at("workspace close w5") < at("worktree remove --workspace w2"));
+    drop(calls);
+    assert!(spaces.list.borrow().is_empty());
 }
 
 #[test]
