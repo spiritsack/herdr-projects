@@ -218,8 +218,14 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Change one setting in PROJECT.md (name, goal, coordinator_profile, thread_profile, max_parallel_threads, auto_resolve_days, nudge, mute, repos.add, repos.remove)
-    Set { slug: String, key: String, value: String },
+    /// Change one setting in PROJECT.md (name, goal, coordinator_profile, thread_profile, max_parallel_threads, auto_resolve_days, nudge, mute, repos.add, repos.remove), or with --global an all-projects one in config.toml (set --global space_order grouped|homes-first|off)
+    Set {
+        /// A project, or --global for an all-projects setting
+        #[arg(allow_hyphen_values = true)]
+        slug: String,
+        key: String,
+        value: String,
+    },
     /// Open a file: text in a new Herdr tab running $EDITOR, anything else with the system opener
     OpenFile {
         path: PathBuf,

@@ -3028,3 +3028,57 @@ fn coordinator_prompt_reaches_its_own_project_s_coordinator_not_one_whose_shell_
         .collect();
     assert_eq!(sent, [("wH:p1".to_string(), "Merge the open PRs.".to_string()), ("wW:p1".to_string(), "Status?".to_string())]);
 }
+
+#[test]
+fn the_ticker_orders_spaces_as_space_order_says_from_the_next_tick() {
+    let world = World::new();
+    let alpha = world.project("alpha", "a.sock");
+    let beta = world.project("beta", "a.sock");
+    beta.update_coordinator(|c| {
+        c.workspace_id = "w2".into();
+        c.tab_id = "w2:t1".into();
+        c.pane_id = "w2:p1".into();
+    })
+    .unwrap();
+    // alpha's thread: worktree Space w3 under its repository's Space w4.
+    let cwd = world.home.path().join("wt");
+    std::fs::create_dir(&cwd).unwrap();
+    world.thread(&alpha, &cwd, |t| {
+        t.workspace_id = "w3".into();
+        t.tab_id = "w3:t1".into();
+        t.pane_id = "w3:p1".into();
+        t.repo_workspace = "w4".into();
+    });
+    let space = |id: &str, worktree: &str| format!(r#"{{"workspace_id":"{id}","label":"{id}","pane_count":1{worktree}}}"#);
+    let linked = |yes: bool| format!(r#","worktree":{{"repo_key":"r","checkout_path":"/r","is_linked_worktree":{yes}}}"#);
+    // Dragged out of order: beta's home first, the worktree away from its repository.
+    let list = [space("w2", ""), space("w3", &linked(true)), space("x", ""), space("w1", ""), space("w4", &linked(false))].join(",");
+    world.runner.on("workspace list", ok(&format!(r#"{{"result":{{"workspaces":[{list}]}}}}"#)));
+    world.runner.on("workspace rename", ok(r#"{"result":{}}"#));
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("x", "x:t1", "x:p1", "/elsewhere", "mine", "idle"));
+    let ctx = world.ctx();
+    let moves = || -> Vec<(String, u64)> {
+        world
+            .runner
+            .socket_requests
+            .borrow()
+            .iter()
+            .filter_map(|(_, line)| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|v| v["method"] == "workspace.move")
+            .map(|v| (v["params"]["workspace_id"].as_str().unwrap_or_default().to_string(), v["params"]["insert_index"].as_u64().unwrap_or(99)))
+            .collect()
+    };
+    let config = ctx.config_dir.join("config.toml");
+    std::fs::create_dir_all(&ctx.config_dir).unwrap();
+
+    std::fs::write(&config, "space_order = \"off\"\n").unwrap();
+    ticker::tick_for_test(&ctx, &mut crate::steps::Memory::new(&ctx));
+    assert_eq!(moves(), Vec::<(String, u64)>::new(), "off: no Space moves");
+    assert!(world.runner.count("report-metadata") > 0, "agents are still grouped");
+
+    // Changed between ticks: the next tick follows it, no restart.
+    std::fs::write(&config, "space_order = \"homes-first\"\n").unwrap();
+    ticker::tick_for_test(&ctx, &mut crate::steps::Memory::new(&ctx));
+    // Wanted: w1 w2 (homes), w4 then its worktree w3, x.
+    assert_eq!(moves(), [("w1".to_string(), 0), ("w4".to_string(), 2)]);
+}

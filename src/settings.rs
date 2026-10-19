@@ -139,8 +139,11 @@ pub fn set_in(text: &str, key: &str, value: &str) -> Result<String> {
     Ok(join(&front, body))
 }
 
-/// `set <slug> <key> <value>`.
+/// `set <slug> <key> <value>`, or `set --global <key> <value>`.
 pub fn set(ctx: &Ctx, slug: &str, key: &str, value: &str) -> Result<()> {
+    if slug == "--global" {
+        return set_global(ctx, key, value);
+    }
     let project = Project::load(&ctx.root, slug)?;
     if let Some(role) = key.strip_suffix("_profile").or(key.strip_suffix("_agent")) {
         // A default must be a profile this project may use.
@@ -160,6 +163,37 @@ pub fn set(ctx: &Ctx, slug: &str, key: &str, value: &str) -> Result<()> {
         let _ = project::write_priming(&project, &crate::coordinator::current_prefix(&ctx.root)?);
     }
     println!("{slug}: {key} = {value}");
+    Ok(())
+}
+
+/// The keys `set --global` accepts, with what they hold.
+pub const GLOBAL_KEYS: [(&str, &str); 1] = [("space_order", "grouped, homes-first or off")];
+
+/// Applies one all-projects setting to config.toml's text, keeping the rest
+/// of the file (comments, formatting, other tables) as it is.
+pub fn set_global_in(text: &str, key: &str, value: &str) -> Result<String> {
+    let mut doc = text.parse::<DocumentMut>().context("config.toml does not parse")?;
+    match key {
+        "space_order" => {
+            let order = crate::grouping::SpaceOrder::parse(value)?;
+            doc[key] = toml_edit::value(order.as_str());
+        }
+        other => bail!("unknown global setting `{other}`; one of: {}", GLOBAL_KEYS.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(", ")),
+    }
+    let text = doc.to_string();
+    // The result must still be a config.toml the binary reads.
+    toml::from_str::<toml::Table>(&text).context("the edited config.toml does not parse")?;
+    Ok(text)
+}
+
+/// `set --global <key> <value>`: an all-projects setting in config.toml.
+pub fn set_global(ctx: &Ctx, key: &str, value: &str) -> Result<()> {
+    let file = ctx.config_dir.join("config.toml");
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    let edited = set_global_in(&text, key, value)?;
+    std::fs::create_dir_all(&ctx.config_dir)?;
+    project::write_atomic(&file, edited.as_bytes())?;
+    println!("all projects: {key} = {}", value.trim());
     Ok(())
 }
 
@@ -289,6 +323,41 @@ mod tests {
         let bare = "+++\nname = \"X\"\n+++\n";
         let added = set_in(bare, "repos.add", "/x@m").unwrap();
         assert_eq!(project::parse_project_md(&added).unwrap().0.repos.len(), 1);
+    }
+
+    #[test]
+    fn global_space_order_is_set_in_place() {
+        let config = "# mine\nroot = \"~/p\" # where projects live\n\n[defaults]\nthread_profile = \"claude\"\n";
+        let edited = set_global_in(config, "space_order", "homes-first").unwrap();
+        assert!(edited.contains("space_order = \"homes-first\""), "{edited}");
+        assert!(edited.contains("# mine") && edited.contains("# where projects live"), "comments survive");
+        assert!(edited.contains("[defaults]\nthread_profile = \"claude\""));
+        let parsed: toml::Table = toml::from_str(&edited).unwrap();
+        assert_eq!(parsed["space_order"].as_str(), Some("homes-first"), "a top-level key, not one in [defaults]");
+        // Set again: replaced, never duplicated.
+        let again = set_global_in(&edited, "space_order", "off").unwrap();
+        assert_eq!(again.matches("space_order").count(), 1);
+        assert!(again.contains("space_order = \"off\""));
+        // No file yet.
+        assert_eq!(set_global_in("", "space_order", "grouped").unwrap(), "space_order = \"grouped\"\n");
+
+        let error = set_global_in(config, "space_order", "sideways").unwrap_err().to_string();
+        assert!(error.contains("grouped, homes-first, off"), "{error}");
+        let error = set_global_in(config, "name", "x").unwrap_err().to_string();
+        assert_eq!(error, "unknown global setting `name`; one of: space_order");
+
+        // Through `set`: written to the config dir, which a failure leaves alone.
+        let root = tempfile::tempdir().unwrap();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let runner = crate::runner::fake::FakeRunner::new();
+        let ctx = Ctx { env: &env, root: root.path().to_path_buf(), config_dir: root.path().join("cfg"), runner: &runner, detached_ticker: false };
+        set(&ctx, "--global", "space_order", "homes-first").unwrap();
+        let file = ctx.config_dir.join("config.toml");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "space_order = \"homes-first\"\n");
+        assert_eq!(crate::grouping::load(&ctx.config_dir), crate::grouping::SpaceOrder::HomesFirst);
+        assert!(set(&ctx, "--global", "space_order", "sideways").is_err());
+        assert!(set(&ctx, "--global", "name", "x").is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "space_order = \"homes-first\"\n");
     }
 
     #[test]

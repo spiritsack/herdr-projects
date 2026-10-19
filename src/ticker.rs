@@ -323,13 +323,15 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         }
     }
     let any_reachable = !reachable.is_empty() || sessions.any_reachable();
-    // One sidebar layout per session, from every project's part.
+    // One sidebar layout per session, from every project's part. The Space
+    // order is read every tick, so a change applies without a restart.
+    let order = crate::grouping::load(&ctx.config_dir);
     for (socket, parts) in std::mem::take(&mut sessions.parts) {
         // Only sessions this tick already listed: a paused project alone
         // costs no call.
         if let Some(Some((agents, _))) = sessions.lists.get(&socket).cloned() {
             let herdr = Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner);
-            crate::grouping::apply(&herdr, &socket, &parts, &agents, &mut memory.grouping);
+            crate::grouping::apply(&herdr, &socket, &parts, &agents, order, &mut memory.grouping);
         }
     }
     for (project, seen) in &reachable {

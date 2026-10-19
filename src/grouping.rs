@@ -9,13 +9,72 @@
 //! display name. A mark in the name, not a list of names in the config,
 //! because a client draws another machine's rows with its own config.
 //!
-//! Agents sort by `$hp_group` in the agent view; Spaces are moved into one
-//! block per project with `workspace.move`. Anything in no project comes last.
+//! Agents sort by `$hp_group` in the agent view. Spaces follow the global
+//! `space_order` setting ([`SpaceOrder`]): `grouped` (the default) moves them
+//! into one block per project with `workspace.move`, anything in no project
+//! last; `homes-first` puts every home Space first, then each project's other
+//! Spaces, keeping a linked worktree under its main checkout; `off` never
+//! moves a Space.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
+use anyhow::{Result, bail};
+use serde::Deserialize;
+
 use crate::herdr::{Agent, CALL_TIMEOUT, Herdr, Workspace};
+
+/// The values `space_order` takes, in the order the popup offers them.
+pub const SPACE_ORDERS: [&str; 3] = ["grouped", "homes-first", "off"];
+
+/// How the ticker orders the Spaces list, across every project.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SpaceOrder {
+    /// One block per project: home, then its threads' Spaces.
+    #[default]
+    Grouped,
+    /// Every home Space first, then each project's other Spaces.
+    HomesFirst,
+    /// Spaces stay where the user puts them.
+    Off,
+}
+
+impl SpaceOrder {
+    pub fn parse(value: &str) -> Result<SpaceOrder> {
+        match value.trim() {
+            "grouped" => Ok(SpaceOrder::Grouped),
+            "homes-first" => Ok(SpaceOrder::HomesFirst),
+            "off" => Ok(SpaceOrder::Off),
+            other => bail!("unknown space_order `{other}`; one of: {}", SPACE_ORDERS.join(", ")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpaceOrder::Grouped => SPACE_ORDERS[0],
+            SpaceOrder::HomesFirst => SPACE_ORDERS[1],
+            SpaceOrder::Off => SPACE_ORDERS[2],
+        }
+    }
+}
+
+/// The `space_order` part of `config.toml`.
+#[derive(Deserialize, Default)]
+struct OrderConfig {
+    #[serde(default)]
+    space_order: Option<String>,
+}
+
+/// `space_order` from `<config_dir>/config.toml`: `grouped` when the file is
+/// missing, does not parse or holds an unknown value.
+pub fn load(config_dir: &Path) -> SpaceOrder {
+    let Ok(text) = std::fs::read_to_string(config_dir.join("config.toml")) else {
+        return SpaceOrder::default();
+    };
+    let config: OrderConfig = toml::from_str(&text).unwrap_or_default();
+    config.space_order.and_then(|v| SpaceOrder::parse(&v).ok()).unwrap_or_default()
+}
 
 /// Ends every home Space label; the Space rows make a label that contains it
 /// the project's bold head.
@@ -88,9 +147,11 @@ pub struct Plan {
 }
 
 /// The whole layout of one session. Agents: projects by slug, each in its own
-/// key order, then every other agent in Herdr's order. Spaces: the same
-/// blocks, then every other Space in Herdr's order.
-pub fn plan(parts: &Parts, agents: &[Agent], workspaces: &[Workspace]) -> Plan {
+/// key order, then every other agent in Herdr's order. Spaces as `order`
+/// says: the same blocks, then every other Space in Herdr's order
+/// (`grouped`); homes, then the rest of each project, then the others
+/// (`homes-first`); or none at all (`off`).
+pub fn plan(parts: &Parts, agents: &[Agent], workspaces: &[Workspace], order: SpaceOrder) -> Plan {
     let mut out = Plan::default();
     if parts.is_empty() {
         return out;
@@ -115,7 +176,16 @@ pub fn plan(parts: &Parts, agents: &[Agent], workspaces: &[Workspace]) -> Plan {
         out.agents.push((pane.to_string(), tokens));
     }
 
-    // Spaces: a stable sort into blocks.
+    match order {
+        SpaceOrder::Grouped => out.order = grouped(parts, workspaces),
+        SpaceOrder::HomesFirst => out.order = homes_first(parts, workspaces),
+        SpaceOrder::Off => {}
+    }
+    out
+}
+
+/// `grouped`: a stable sort into one block per project.
+fn grouped(parts: &Parts, workspaces: &[Workspace]) -> Vec<String> {
     let mut space_owner: HashMap<&str, (&str, usize)> = HashMap::new();
     for (slug, part) in parts {
         for (i, id) in part.spaces.iter().enumerate() {
@@ -131,7 +201,69 @@ pub fn plan(parts: &Parts, agents: &[Agent], workspaces: &[Workspace]) -> Plan {
         })
         .collect();
     ordered.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-    out.order = ordered.iter().map(|(_, _, w)| w.workspace_id.clone()).collect();
+    ordered.iter().map(|(_, _, w)| w.workspace_id.clone()).collect()
+}
+
+/// `homes-first`: every project's home Space by slug, then each project's
+/// other Spaces by slug, then every other Space in Herdr's order. A linked
+/// worktree Space then moves directly under its primary Space (the first
+/// unlinked Space of its repository), after its siblings, as Herdr nests it.
+fn homes_first(parts: &Parts, workspaces: &[Workspace]) -> Vec<String> {
+    let present: HashSet<&str> = workspaces.iter().map(|w| w.workspace_id.as_str()).collect();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut list: Vec<&str> = Vec::new();
+    for part in parts.values() {
+        let home = if part.home.is_empty() { part.spaces.first().map(String::as_str) } else { Some(part.home.as_str()) };
+        if let Some(home) = home.and_then(|h| present.get(h).copied())
+            && seen.insert(home)
+        {
+            list.push(home);
+        }
+    }
+    for part in parts.values() {
+        for id in &part.spaces {
+            if let Some(id) = present.get(id.as_str()).copied()
+                && seen.insert(id)
+            {
+                list.push(id);
+            }
+        }
+    }
+    for w in workspaces {
+        if seen.insert(w.workspace_id.as_str()) {
+            list.push(w.workspace_id.as_str());
+        }
+    }
+
+    // Nesting: each repository's primary Space, then its linked worktrees.
+    let mut primary: HashMap<&str, &str> = HashMap::new();
+    for w in workspaces {
+        if let Some(t) = &w.worktree
+            && !t.is_linked_worktree
+            && !t.repo_key.is_empty()
+        {
+            primary.entry(t.repo_key.as_str()).or_insert(w.workspace_id.as_str());
+        }
+    }
+    let by_id: HashMap<&str, &Workspace> = workspaces.iter().map(|w| (w.workspace_id.as_str(), w)).collect();
+    let nested_repo = |id: &str| -> Option<&str> {
+        let t = by_id.get(id)?.worktree.as_ref()?;
+        (t.is_linked_worktree && primary.contains_key(t.repo_key.as_str())).then_some(t.repo_key.as_str())
+    };
+    let mut out = Vec::with_capacity(list.len());
+    for &id in &list {
+        if nested_repo(id).is_some() {
+            continue;
+        }
+        out.push(id.to_string());
+        let Some(t) = by_id.get(id).and_then(|w| w.worktree.as_ref()) else {
+            continue;
+        };
+        if t.is_linked_worktree || primary.get(t.repo_key.as_str()) != Some(&id) {
+            continue;
+        }
+        out.extend(list.iter().filter(|x| nested_repo(x) == Some(t.repo_key.as_str())).map(|x| x.to_string()));
+    }
     out
 }
 
@@ -211,10 +343,10 @@ pub fn clear(herdr: &Herdr, kind: &str, id: &str) {
     report(herdr, kind, id, &all);
 }
 
-/// Lays out one session: marks home Spaces, moves Spaces into blocks and
-/// writes every agent's sort key and sub-line. Nothing when no project lives
-/// in the session.
-pub fn apply(herdr: &Herdr, socket: &str, parts: &Parts, agents: &[Agent], sent: &mut Sent) {
+/// Lays out one session: marks home Spaces, moves Spaces as `order` says
+/// (never with `off`) and writes every agent's sort key and sub-line.
+/// Nothing when no project lives in the session.
+pub fn apply(herdr: &Herdr, socket: &str, parts: &Parts, agents: &[Agent], order: SpaceOrder, sent: &mut Sent) {
     if parts.is_empty() {
         return;
     }
@@ -226,11 +358,13 @@ pub fn apply(herdr: &Herdr, socket: &str, parts: &Parts, agents: &[Agent], sent:
             w.label = label;
         }
     }
-    let layout = plan(parts, agents, &workspaces);
-    let current: Vec<String> = workspaces.iter().map(|w| w.workspace_id.clone()).collect();
-    for (id, index) in moves(&current, &layout.order) {
-        if herdr.workspace_move(&id, index).is_err() {
-            break;
+    let layout = plan(parts, agents, &workspaces, order);
+    if order != SpaceOrder::Off {
+        let current: Vec<String> = workspaces.iter().map(|w| w.workspace_id.clone()).collect();
+        for (id, index) in moves(&current, &layout.order) {
+            if herdr.workspace_move(&id, index).is_err() {
+                break;
+            }
         }
     }
     for (pane, tokens) in &layout.agents {
@@ -283,7 +417,7 @@ mod tests {
     #[test]
     fn agents_sort_into_projects_with_their_own_sub_lines_and_others_last() {
         let agents: Vec<Agent> = ["x1", "a2", "b1", "a3", "x2", "a1"].into_iter().map(agent).collect();
-        let layout = plan(&parts(), &agents, &[]);
+        let layout = plan(&parts(), &agents, &[], SpaceOrder::Grouped);
         let order: Vec<&str> = layout.agents.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(order, ["a1", "a3", "a2", "b1", "x1", "x2"]);
         let t: HashMap<&str, &Tokens> = layout.agents.iter().map(|(p, t)| (p.as_str(), t)).collect();
@@ -310,8 +444,91 @@ mod tests {
             space("wt2", "r", true),
             space("other2", "", false),
         ];
-        let layout = plan(&parts(), &[], &workspaces);
+        let layout = plan(&parts(), &[], &workspaces, SpaceOrder::Grouped);
         assert_eq!(layout.order, ["wa", "repo", "wt2", "wt3", "wb", "mine", "other2"]);
+    }
+
+    fn fixture_spaces() -> Vec<Workspace> {
+        vec![
+            space("mine", "", false),
+            space("wt3", "r", true),
+            space("wb", "", false),
+            space("repo", "r", false),
+            space("wa", "", false),
+            space("wt2", "r", true),
+            space("other2", "", false),
+        ]
+    }
+
+    #[test]
+    fn space_order_defaults_to_grouped() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load(dir.path()), SpaceOrder::Grouped, "no config.toml");
+        let file = dir.path().join("config.toml");
+        for text in ["root = \"~/p\"\n", "this is = = not toml", "space_order = \"bogus\"\n", "space_order = 3\n"] {
+            std::fs::write(&file, text).unwrap();
+            assert_eq!(load(dir.path()), SpaceOrder::Grouped, "{text}");
+        }
+        std::fs::write(&file, "root = \"~/p\"\nspace_order = \"homes-first\"\n[defaults]\nthread_profile = \"claude\"\n").unwrap();
+        assert_eq!(load(dir.path()), SpaceOrder::HomesFirst);
+        std::fs::write(&file, "space_order = \"off\"\n").unwrap();
+        assert_eq!(load(dir.path()), SpaceOrder::Off);
+        for value in SPACE_ORDERS {
+            assert_eq!(SpaceOrder::parse(value).unwrap().as_str(), value);
+        }
+        let error = SpaceOrder::parse("sideways").unwrap_err().to_string();
+        assert!(error.contains("grouped, homes-first, off"), "{error}");
+    }
+
+    #[test]
+    fn homes_first_puts_every_home_first_then_threads_by_project() {
+        let layout = plan(&parts(), &[], &fixture_spaces(), SpaceOrder::HomesFirst);
+        assert_eq!(layout.order, ["wa", "wb", "repo", "wt2", "wt3", "mine", "other2"]);
+    }
+
+    #[test]
+    fn homes_first_keeps_linked_worktrees_under_their_main_checkout() {
+        let mut parts = Parts::new();
+        // alpha's thread opened repo r (primary `ra`); beta's thread has a
+        // worktree of r too. gamma's home is the main checkout of repo h,
+        // and its thread a worktree of it.
+        parts.insert("alpha".into(), ProjectPart { home: "ha".into(), spaces: vec!["ha".into(), "ra".into(), "wa1".into()], ..ProjectPart::default() });
+        parts.insert("beta".into(), ProjectPart { home: "hb".into(), spaces: vec!["hb".into(), "wb1".into()], ..ProjectPart::default() });
+        parts.insert("gamma".into(), ProjectPart { home: "hg".into(), spaces: vec!["hg".into(), "wg1".into()], ..ProjectPart::default() });
+        let workspaces = vec![
+            space("wb1", "r", true),
+            space("hb", "", false),
+            space("wg1", "h", true),
+            space("ra", "r", false),
+            space("hg", "h", false),
+            space("wa1", "r", true),
+            space("ha", "", false),
+            space("loose", "x", true),
+        ];
+        let layout = plan(&parts, &[], &workspaces, SpaceOrder::HomesFirst);
+        // (a) beta's worktree follows its primary in alpha's block, after
+        // alpha's own; (b) gamma's worktree follows gamma's home. A worktree
+        // whose primary is not open stays where it falls.
+        assert_eq!(layout.order, ["ha", "hb", "hg", "wg1", "ra", "wa1", "wb1", "loose"]);
+    }
+
+    #[test]
+    fn off_never_moves_spaces() {
+        let workspaces = fixture_spaces();
+        let layout = plan(&parts(), &[], &workspaces, SpaceOrder::Off);
+        assert!(layout.order.is_empty());
+        let current: Vec<String> = workspaces.iter().map(|w| w.workspace_id.clone()).collect();
+        assert!(moves(&current, &layout.order).is_empty());
+    }
+
+    #[test]
+    fn agents_are_the_same_in_every_order() {
+        let agents: Vec<Agent> = ["x1", "a2", "b1", "a3", "x2", "a1"].into_iter().map(agent).collect();
+        let grouped = plan(&parts(), &agents, &fixture_spaces(), SpaceOrder::Grouped).agents;
+        assert!(!grouped.is_empty());
+        for order in [SpaceOrder::HomesFirst, SpaceOrder::Off] {
+            assert_eq!(plan(&parts(), &agents, &fixture_spaces(), order).agents, grouped, "{order:?}");
+        }
     }
 
     #[test]
@@ -354,6 +571,8 @@ mod tests {
 
     #[test]
     fn no_project_means_no_layout() {
-        assert_eq!(plan(&Parts::new(), &[agent("x")], &[space("w", "", false)]), Plan::default());
+        for order in [SpaceOrder::Grouped, SpaceOrder::HomesFirst, SpaceOrder::Off] {
+            assert_eq!(plan(&Parts::new(), &[agent("x")], &[space("w", "", false)], order), Plan::default());
+        }
     }
 }

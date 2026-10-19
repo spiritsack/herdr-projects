@@ -77,6 +77,37 @@ fn ticker_start_without_projects_creates_nothing() {
     assert!(!home.path().join(".config").exists());
 }
 
+#[test]
+fn set_global_space_order_writes_config_toml_and_refuses_bad_values() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    let config_dir = home.path().join(".config/herdr-projects");
+    let config = config_dir.join("config.toml");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(&config, "# mine\n[defaults]\nthread_profile = \"claude\"\n").unwrap();
+
+    let out = hp(home.path(), &["--root", root_arg, "set", "--global", "space_order", "homes-first"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "all projects: space_order = homes-first\n");
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert!(written.contains("space_order = \"homes-first\"") && written.contains("# mine") && written.contains("thread_profile = \"claude\""), "{written}");
+
+    for (args, says) in [(["space_order", "sideways"], "grouped, homes-first, off"), (["name", "x"], "one of: space_order")] {
+        let out = hp(home.path(), &["--root", root_arg, "set", "--global", args[0], args[1]]);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains(says), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), written, "a refused value leaves config.toml alone");
+    }
+
+    // A project's own settings work as before.
+    assert!(hp(home.path(), &["--root", root_arg, "new", "demo"]).status.success());
+    let out = hp(home.path(), &["--root", root_arg, "set", "demo", "goal", "Ship it"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "demo: goal = Ship it\n");
+    assert!(std::fs::read_to_string(root.join("demo/PROJECT.md")).unwrap().contains("goal = \"Ship it\""));
+}
+
 #[cfg(unix)]
 mod progress_hooks {
     use super::*;
