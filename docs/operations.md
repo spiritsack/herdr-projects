@@ -10,7 +10,8 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
 - **The binary does mechanics.** Starting a thread, copying reports, cleaning up after a resolve: each is one deterministic subcommand. It talks to Herdr through Herdr's CLI. The exception is the agent view (`focus`, `unfocus`, the default sort): Herdr 0.9.1 has no CLI for `agent.view.set`, so those send one JSON line to the socket.
 - **Agents report their own progress.** `herdr-projects report --percent N --activity "..."`, run by the agent in its pane, writes one small JSON file per pane under `<root>/.progress/` which the ticker shows on the pane's sub-line for five minutes. Thread briefs and the coordinator skill carry the instructions, so any agent reports; hooks in Claude Code, Codex, Droid, Gemini CLI and Copilot CLI (installed by `configure`) also inject them and a reminder, but only in a project's coordinator and local thread panes: every other pane gets no hook text and no record. A conversation keeps what a hook injected before 0.2.35; start a fresh session to drop it. There is no daemon and no database.
 - **Files are the record, prompts are nudges.** Threads write a report file, the ticker writes events to an inbox folder, and the coordinator reads state with `context` at the start of every turn. A missed prompt loses nothing.
-- **One ticker per projects root** checks every 15 seconds: coordinators (any agent in a project folder, also one started by hand in a project never opened), thread state and groups, sidebar tokens and the per-project grouping of agents and Spaces, pending prompts, changed reports, pull requests (every two minutes), routines, auto-resolve, notifications. Remote machines are polled once a minute.
+- **One ticker per projects root** checks every 15 seconds: coordinators (any agent in a project folder, also one started by hand in a project never opened), thread state and groups, sidebar tokens and the per-project grouping of agents and Spaces (Spaces as `space_order` says, see below), pending prompts, changed reports, pull requests (every two minutes), routines, auto-resolve, notifications. Remote machines are polled once a minute.
+- **The Space order is yours to choose.** `space_order` in config.toml, set with `herdr-projects set --global space_order <value>` or the popup's all-projects settings, applies to every project from the next tick. `grouped` (the default) keeps one block per project, home Space first, and moves a Space you drag elsewhere back. `homes-first` puts every project's home Space first (by project), then each project's other Spaces, then the rest. `off` never moves a Space. In `homes-first` a linked worktree Space stays directly under its repository's main-checkout Space, as Herdr nests it. Agents are grouped by project in every mode.
 - **Tools are found even under a bare `PATH`.** The binary appends `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and `~/.cargo/bin` to its own `PATH`, so a ticker started by Herdr finds `gh` and `rsync`.
 - **Cleanup is part of the flow, never forced.** Resolving a thread removes its worktree (Herdr and git refuse a dirty one, and the plugin never forces) and, once its pull request is merged, its local branch. Reports and library files always stay. Text from reports, pull requests and command output is never placed in a prompt.
 
@@ -32,7 +33,7 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
   library/<id>/           home copy of files a thread produced
   .state/                 status, coordinator record, live coordinators, ticker state, lock
 ~/.herdr-projects/.ticker.lock  .ticker.log  .progress/  .trash/
-~/.config/herdr-projects/config.toml             yours: root, profiles, safety tables, machines
+~/.config/herdr-projects/config.toml             yours: root, profiles, safety tables, machines, space_order
 ~/.config/herdr-projects/owned.json              what `configure` changed, for `unconfigure`
 ~/.config/herdr-projects/approved-routines.json  written only by `routine approve`
 ```
@@ -56,7 +57,7 @@ Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`
 | `thread list/show [--json]`, `thread ack`, `thread adopt` | Look at threads. |
 | `thread resolve [--keep-worktree] [--discard-uncopied] [--skip-copy] [--reopen]` | Final copy home, then clean up. |
 | `sweep <project> [--dry-run] [--yes]` | Remove what nothing uses any more. |
-| `set <project> <key> <value>`, `routine list/toggle/approve`, `safety show/yolo/set` | Settings, routines and safety (see below). |
+| `set <project> <key> <value>`, `set --global space_order grouped\|homes-first\|off`, `routine list/toggle/approve`, `safety show/yolo/set` | Settings, the all-projects Space order, routines and safety (see below). |
 | `profile list [--project P \| --names]`, `profile resolve [NAME]`, `profile add/edit/remove`, `profile allow threads\|coordinator NAMES... [--project P] [--all]`, `profile default threads\|coordinator NAME` | [Agent profiles](#agent-profiles). Everything but `list` and `resolve` needs a person at a terminal. |
 | `pause`, `resume`, `archive`, `unarchive`, `delete [--force]` | Project lifecycle. |
 | `rename <project> <new-slug> [--name NAME] [--dry-run]` | A new slug (folder name), and with `--name` a new display name. Refused while a thread is not resolved. While agents run in the project folder (its coordinator, which may run it itself) the ticker takes over: once they are idle (at most 5 minutes) it closes their panes, renames, reopens the coordinator in the new folder resuming its conversation, and prompts it with a note; `thread start` is refused meanwhile. The folder moves in one step; the thread records, the coordinator record, `AGENTS.md`, the project's `[safety]` table (yolo, profile lists), routine approvals and the home Space's label follow it. Branches and worktrees keep `hp/<old>/` and `sweep` still finds them; the coordinator's conversation follows (Claude Code's transcript is copied to the new folder; other harnesses resume by id, one that cannot starts anew). It lists what it could not update (other machines), then runs `doctor`. Run it again to finish one that stopped halfway. |
@@ -88,7 +89,7 @@ Threads idle for `auto_resolve_days` are resolved (and cleaned) after a final co
 | tasks | `↵` jump to the delegated thread (or show the notes of a task without one) · `i` notes (a task with notes ends in `≡`) · `d` delegate · `m` done · `D` drop (each sends a sentence to the coordinator, which stays the only writer of TASKS.md) |
 | inbox | `↵` detail · `a` done |
 | routines | `↵` enable or disable · `i` the prompt |
-| settings | `↵` edit (also a safety row) · `Y` yolo mode on or off (asks before turning on) · `p` pause or resume · `A` archive · `X` delete (asks first). Unscoped, the rows are the all-projects safety defaults |
+| settings | `↵` edit (also a safety row) · `Y` yolo mode on or off (asks before turning on) · `p` pause or resume · `A` archive · `X` delete (asks first). Unscoped, the rows are the profiles, the all-projects defaults (with `space_order`) and the all-projects safety defaults |
 | memory | `↵` read (change memory by asking the coordinator) |
 
 ## Safety settings

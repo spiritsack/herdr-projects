@@ -518,6 +518,7 @@ fn profile_rows(ctx: &Ctx, rows: &mut Vec<Row>) {
         ("coordinator_profile", config.new_project_default(Role::Coordinator), "coordinator_profile (new projects)"),
         ("thread_profiles", allowed_text(ctx, None, Role::Thread), "thread_profiles (all projects)"),
         ("coordinator_profiles", allowed_text(ctx, None, Role::Coordinator), "coordinator_profiles (all projects)"),
+        ("space_order", crate::grouping::load(&ctx.config_dir).as_str().to_string(), "space_order (all projects)"),
     ];
     for (key, value, label) in values {
         rows.push(Row { header: false, text: format!("  {label:<36} {value}"), color: None, kind: RowKind::Setting { slug: String::new(), key: key.into(), value } });
@@ -1143,6 +1144,15 @@ impl<'a> Popup<'a> {
                 }
                 _ => {}
             },
+            Some(RowKind::Setting { slug, key: name, value }) if slug.is_empty() && name == "space_order" => {
+                if key.code == KeyCode::Enter {
+                    // The current value last, as with nudge and mute: the first option is a change.
+                    let mut options: Vec<String> = crate::grouping::SPACE_ORDERS.iter().filter(|o| **o != value).map(|o| o.to_string()).collect();
+                    options.push(value);
+                    let action = ["set", "--global", "space_order", "{}"].map(String::from).to_vec();
+                    self.mode = Mode::Pick { label: "space_order for all projects (current last; applies on the next tick)".into(), options, selected: 0, action };
+                }
+            }
             Some(RowKind::Setting { slug, key: name, value }) if slug.is_empty() => {
                 if key.code == KeyCode::Enter {
                     let role = if name.starts_with("thread") { Role::Thread } else { Role::Coordinator };
@@ -1781,6 +1791,67 @@ mod tests {
         key(&mut popup, KeyCode::Char(' '));
         key(&mut popup, KeyCode::Enter);
         assert_eq!(project::load_safety(&ctx.config_dir, Path::new("")).unwrap().thread_profiles, Some(vec!["deep".to_string()]));
+    }
+
+    #[test]
+    fn space_order_is_picked_from_the_all_projects_settings() {
+        let world = crate::scenarios::World::new();
+        world.project("alpha", "a.sock");
+        let ctx = world.ctx();
+        // The binary's own `set --global`, run in-process against the same config dir.
+        let config_dir = ctx.config_dir.clone();
+        world.runner.on_fn(
+            |cmd| cmd.display().contains("set --global space_order"),
+            move |cmd| {
+                let file = config_dir.join("config.toml");
+                let value = cmd.args.last().unwrap();
+                match crate::settings::set_global_in(&std::fs::read_to_string(&file).unwrap_or_default(), "space_order", value) {
+                    Ok(text) => {
+                        std::fs::create_dir_all(&config_dir).unwrap();
+                        std::fs::write(&file, text).unwrap();
+                        Ok(crate::runner::fake::ok(&format!("all projects: space_order = {value}\n")))
+                    }
+                    Err(error) => Ok(crate::runner::fake::fail(1, &format!("herdr-projects: {error:#}\n"))),
+                }
+            },
+        );
+        let mut popup = Popup::new(&ctx, None, String::new());
+        let key = |popup: &mut Popup, code| popup.key(KeyEvent::new(code, KeyModifiers::NONE));
+        popup.section = SECTIONS.iter().position(|s| *s == Section::Settings).unwrap();
+        popup.reload();
+        let row = |popup: &Popup| popup.rows.iter().position(|r| matches!(&r.kind, RowKind::Setting { slug, key, .. } if slug.is_empty() && key == "space_order")).unwrap();
+        let at = row(&popup);
+        assert_eq!(popup.rows[at].text, format!("  {:<36} grouped", "space_order (all projects)"));
+        // The last row of the profile block, before the projects.
+        assert!(matches!(&popup.rows[at - 1].kind, RowKind::Setting { key, .. } if key == "coordinator_profiles"));
+
+        // Esc writes nothing.
+        popup.selected = at;
+        key(&mut popup, KeyCode::Enter);
+        assert!(matches!(&popup.mode, Mode::Pick { options, selected: 0, .. } if options == &["homes-first", "off", "grouped"]));
+        key(&mut popup, KeyCode::Esc);
+        assert!(matches!(popup.mode, Mode::List));
+        assert!(!ctx.config_dir.join("config.toml").exists());
+
+        // Enter on the first option: homes-first, through `set --global`.
+        popup.selected = row(&popup);
+        key(&mut popup, KeyCode::Enter);
+        key(&mut popup, KeyCode::Enter);
+        assert!(matches!(popup.mode, Mode::List), "{}", popup.message);
+        assert_eq!(popup.message, "all projects: space_order = homes-first");
+        assert_eq!(world.runner.count("set --global space_order homes-first"), 1);
+        assert_eq!(std::fs::read_to_string(ctx.config_dir.join("config.toml")).unwrap(), "space_order = \"homes-first\"\n");
+        let at = row(&popup);
+        assert!(popup.rows[at].text.ends_with(" homes-first"));
+
+        // The current value is now last; pick `off` (one down).
+        popup.selected = at;
+        key(&mut popup, KeyCode::Enter);
+        assert!(matches!(&popup.mode, Mode::Pick { options, .. } if options == &["grouped", "off", "homes-first"]));
+        key(&mut popup, KeyCode::Down);
+        key(&mut popup, KeyCode::Enter);
+        assert_eq!(std::fs::read_to_string(ctx.config_dir.join("config.toml")).unwrap(), "space_order = \"off\"\n");
+        assert_eq!(crate::grouping::load(&ctx.config_dir), crate::grouping::SpaceOrder::Off);
     }
 
     #[test]
