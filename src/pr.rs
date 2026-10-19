@@ -179,14 +179,19 @@ struct GhOwner {
 /// Reduces `gh pr view --json …` output, refusing a pull request whose head
 /// branch or head repository is not the thread's. Matching on the head
 /// repository, not the URL, keeps fork workflows working: there `origin` is the
-/// fork and the pull request URL is upstream.
-pub fn reduce(json: &str, branch: &str, origin: &str) -> Result<Checked> {
+/// fork and the pull request URL is upstream. `branch` is `None` for a checkout
+/// thread, which has no branch of its own and follows the pull request its
+/// report names on any head branch; the head repository must still be
+/// `origin`. The head branch name is only compared, never kept.
+pub fn reduce(json: &str, branch: Option<&str>, origin: &str) -> Result<Checked> {
     let view: GhView = serde_json::from_str(json)?;
-    if branch.is_empty() {
-        return Ok(Checked::Ignored("the thread has no branch".into()));
-    }
-    if view.head_ref_name != branch {
-        return Ok(Checked::Ignored("its head branch is not the thread's branch".into()));
+    if let Some(branch) = branch {
+        if branch.is_empty() {
+            return Ok(Checked::Ignored("the thread has no branch".into()));
+        }
+        if view.head_ref_name != branch {
+            return Ok(Checked::Ignored("its head branch is not the thread's branch".into()));
+        }
     }
     let head = format!(
         "{}/{}",
@@ -490,7 +495,7 @@ mod tests {
 
     #[test]
     fn a_fork_pull_request_matches_on_the_head_repository_and_carries_no_bodies() {
-        let checked = reduce(VIEW, "hp/demo/t-0001-x", "git@github.com:forker/app.git").unwrap();
+        let checked = reduce(VIEW, Some("hp/demo/t-0001-x"), "git@github.com:forker/app.git").unwrap();
         let Checked::Summary(summary) = checked else { panic!("ignored") };
         assert_eq!(summary.state, "OPEN");
         assert_eq!(summary.review_decision, "APPROVED");
@@ -504,10 +509,17 @@ mod tests {
 
     #[test]
     fn owner_repo_or_branch_mismatch_ignores_the_pull_request() {
-        assert!(matches!(reduce(VIEW, "hp/demo/t-0001-x", "https://github.com/upstream/app").unwrap(), Checked::Ignored(_)));
-        assert!(matches!(reduce(VIEW, "hp/demo/t-0002-y", "git@github.com:forker/app.git").unwrap(), Checked::Ignored(_)));
-        assert!(matches!(reduce(VIEW, "", "git@github.com:forker/app.git").unwrap(), Checked::Ignored(_)));
-        assert!(matches!(reduce(VIEW, "hp/demo/t-0001-x", "").unwrap(), Checked::Ignored(_)));
+        assert!(matches!(reduce(VIEW, Some("hp/demo/t-0001-x"), "https://github.com/upstream/app").unwrap(), Checked::Ignored(_)));
+        assert!(matches!(reduce(VIEW, Some("hp/demo/t-0002-y"), "git@github.com:forker/app.git").unwrap(), Checked::Ignored(_)));
+        assert!(matches!(reduce(VIEW, Some(""), "git@github.com:forker/app.git").unwrap(), Checked::Ignored(_)));
+        assert!(matches!(reduce(VIEW, Some("hp/demo/t-0001-x"), "").unwrap(), Checked::Ignored(_)));
+    }
+
+    #[test]
+    fn reduce_with_no_branch_accepts_any_head_branch_but_not_another_repository() {
+        assert!(matches!(reduce(VIEW, None, "git@github.com:forker/app.git").unwrap(), Checked::Summary(_)));
+        assert!(matches!(reduce(VIEW, None, "https://github.com/upstream/app").unwrap(), Checked::Ignored(_)));
+        assert!(matches!(reduce(VIEW, None, "").unwrap(), Checked::Ignored(_)));
     }
 
     #[test]
