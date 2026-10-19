@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use crate::herdr::{Herdr, Workspace};
+use crate::herdr::{Agent, Herdr, Pane, Workspace};
 use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::thread::{self, Kind, Status, Thread};
@@ -26,6 +26,27 @@ fn canonical(path: &str) -> PathBuf {
 pub fn primary<'w>(workspaces: &'w [Workspace], repo: &str) -> Option<&'w Workspace> {
     let repo = canonical(repo);
     workspaces.iter().find(|w| w.worktree.as_ref().is_some_and(|t| !t.is_linked_worktree && canonical(&t.checkout_path) == repo))
+}
+
+/// The linked-worktree Spaces herdr lists on the checkout at `path`: Spaces
+/// `herdr worktree create` or `herdr worktree open` made there. Never a
+/// repository's primary Space.
+pub fn on_worktree<'w>(workspaces: &'w [Workspace], path: &str) -> Vec<&'w Workspace> {
+    let path = canonical(path);
+    workspaces.iter().filter(|w| w.worktree.as_ref().is_some_and(|t| t.is_linked_worktree && canonical(&t.checkout_path) == path)).collect()
+}
+
+/// Nothing runs in `space` and nobody looks at it: no agent, every pane an
+/// idle shell (and herdr lists them all). A focused Space or pane counts as
+/// in use unless `include_focused`.
+pub fn idle(herdr: &Herdr, panes: &[Pane], agents: &[Agent], space: &Workspace, include_focused: bool) -> bool {
+    let id = &space.workspace_id;
+    let own: Vec<_> = panes.iter().filter(|p| &p.workspace_id == id).collect();
+    !own.is_empty()
+        && own.len() == space.pane_count
+        && !agents.iter().any(|a| &a.workspace_id == id)
+        && (include_focused || !(space.focused || own.iter().any(|p| p.focused)))
+        && own.iter().all(|p| herdr.pane_idle_shell(&p.pane_id))
 }
 
 fn local_worktree(t: &Thread) -> bool {
@@ -85,14 +106,7 @@ pub fn empty(ctx: &Ctx, project: &Project, herdr: &Herdr, include_focused: bool)
         };
         let key = space.worktree.as_ref().map(|t| t.repo_key.as_str()).unwrap_or_default();
         let has_children = workspaces.iter().any(|w| w.worktree.as_ref().is_some_and(|t| t.is_linked_worktree && t.repo_key == key));
-        let own: Vec<_> = panes.iter().filter(|p| p.workspace_id == id).collect();
-        if has_children
-            || own.is_empty()
-            || own.len() != space.pane_count
-            || agents.iter().any(|a| a.workspace_id == id)
-            || (!include_focused && (space.focused || own.iter().any(|p| p.focused)))
-            || !own.iter().all(|p| herdr.pane_idle_shell(&p.pane_id))
-        {
+        if has_children || !idle(herdr, &panes, &agents, space, include_focused) {
             continue;
         }
         found.push(Space { id, label: space.label.clone() });
@@ -302,6 +316,39 @@ mod tests {
         f.workspaces.borrow_mut().pop();
         *f.world.panes.borrow_mut() = format!("[{}]", f.world.coordinator_pane(&f.project));
         assert_eq!(close(&f), 0);
+    }
+
+    #[test]
+    fn on_worktree_matches_only_linked_spaces_on_that_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("wt");
+        let other = dir.path().join("other");
+        std::fs::create_dir(&wt).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        // The same checkout reached through a symlink and a `..` detour.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&wt, &link).unwrap();
+        let wt = wt.to_string_lossy().into_owned();
+        let detour = format!("{}/../wt", other.to_string_lossy());
+        let space = |id: &str, repo: &str, path: &str, linked: bool| -> Workspace {
+            serde_json::from_str(&format!(r#"{{"workspace_id":"{id}","label":"{id}","pane_count":1,"worktree":{{"repo_key":"{repo}/.git","checkout_path":"{path}","is_linked_worktree":{linked}}}}}"#)).unwrap()
+        };
+        let workspaces = vec![
+            serde_json::from_str::<Workspace>(r#"{"workspace_id":"w1","label":"Demo","pane_count":1}"#).unwrap(),
+            space("w2", "/repo", &wt, true),
+            space("w3", "/repo", &other.to_string_lossy(), true),
+            // A primary Space whose main checkout happens to be that folder.
+            space("w4", "/repo", &wt, false),
+            space("w5", "/repo", &link.to_string_lossy(), true),
+            // Another repository's Space on another folder.
+            space("w6", "/elsewhere", "/elsewhere/wt", true),
+            space("w7", "/repo", &detour, true),
+        ];
+        let ids = |path: &str| on_worktree(&workspaces, path).into_iter().map(|w| w.workspace_id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&wt), ["w2", "w5", "w7"]);
+        assert_eq!(ids(&link.to_string_lossy()), ["w2", "w5", "w7"]);
+        assert_eq!(ids(&other.to_string_lossy()), ["w3"]);
+        assert!(ids("/nowhere").is_empty());
     }
 
     #[test]

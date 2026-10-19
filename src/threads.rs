@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::herdr::{Agent, Herdr, Pane};
+use crate::spaces::Space;
 use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::runner::{Cmd, Runner};
@@ -76,9 +77,12 @@ pub struct StartArgs {
     /// it must be on the project's allow-list.
     pub profile: Option<String>,
     /// Placement (`--kind worktree|tab|checkout`); default worktree with a
-    /// repo, tab without one.
+    /// repo (`--repo`, or the project's only one), tab without one.
     pub kind: Option<Kind>,
     pub base: Option<String>,
+    /// The worktree's branch (`--branch`), default `hp/<slug>/<id>-<title>`.
+    /// Worktree threads only; it must not exist yet.
+    pub branch: Option<String>,
     pub task: String,
 }
 
@@ -148,13 +152,21 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         bail!("the task is empty");
     }
     let (settings, _) = project.read_project_md()?;
-    // Without a running ticker nothing launches.
-    ticker::start(ctx)?;
-    let view = require_session(ctx, &project)?;
 
-    let listed = args.repo.as_ref().and_then(|repo| settings.repos.iter().find(|r| &r.path == repo));
+    // Without --repo, a project with exactly one repo uses it, so the thread
+    // gets its own worktree. An explicit tab or checkout is left as asked, and
+    // so is a --machine the repo is not on.
+    let only_repo = match (&args.repo, settings.repos.as_slice(), args.kind) {
+        (None, [only], None | Some(Kind::Worktree)) if args.machine.is_none() || args.machine == only.machine => Some(only.path.clone()),
+        _ => None,
+    };
+    if let Some(path) = &only_repo {
+        eprintln!("note: no --repo given; using {path}, the project's only repo");
+    }
+    let requested_repo = args.repo.clone().or(only_repo);
+    let listed = requested_repo.as_ref().and_then(|repo| settings.repos.iter().find(|r| &r.path == repo));
     let machine = args.machine.clone().or_else(|| listed.and_then(|r| r.machine.clone())).unwrap_or_default();
-    let repo = match (&args.repo, machine.is_empty()) {
+    let repo = match (&requested_repo, machine.is_empty()) {
         (None, false) => bail!("a remote thread needs --repo: a task with no repository runs as a tab in the project's own workspace, which is local"),
         (None, true) => String::new(),
         // A remote path is stored as it is on its own machine.
@@ -173,6 +185,23 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     if !machine.is_empty() && listed.is_none() {
         eprintln!("warning: {repo} on {machine} is not listed in `repos` in PROJECT.md");
     }
+    let kind = placement(args.kind, !repo.is_empty(), !machine.is_empty())?;
+    let branch = match args.branch.as_deref() {
+        None => String::new(),
+        Some(_) if kind != Kind::Worktree => bail!("--branch is only for a worktree thread"),
+        Some(name) => {
+            if !machine.is_empty() {
+                // herdr on the thread's machine refuses a bad or taken branch.
+                name.to_string()
+            } else {
+                check_new_branch(ctx.runner, &repo, name)?
+            }
+        }
+    };
+
+    // Without a running ticker nothing launches.
+    ticker::start(ctx)?;
+    let view = require_session(ctx, &project)?;
 
     let open_count = thread::list(&project).iter().filter(|t| t.status == Status::Open || t.status == Status::Starting).count();
     if open_count as u32 >= settings.max_parallel_threads {
@@ -183,7 +212,6 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     }
 
     let profile = thread_profile(ctx, &project, &machine, args.profile.as_deref())?;
-    let kind = placement(args.kind, !repo.is_empty(), !machine.is_empty())?;
     let record = thread::allocate(&project, |t| {
         t.title = args.title.trim().to_string();
         t.kind = kind;
@@ -191,6 +219,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         t.machine = machine.clone();
         profile.apply(t);
         t.base = args.base.clone().unwrap_or_default();
+        t.branch = branch.clone();
     })?;
     let id = record.id.clone();
     {
@@ -212,6 +241,28 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     }
 }
 
+/// A `--branch` for a local worktree thread: a valid branch name that does not
+/// exist in `repo` yet. Each is one argument to git, never through a shell.
+fn check_new_branch(runner: &dyn Runner, repo: &str, name: &str) -> Result<String> {
+    if name.starts_with('-') || git(runner, repo, &["check-ref-format", "--branch", name], GIT_TIMEOUT).is_err() {
+        bail!("--branch {name} is not a valid branch name");
+    }
+    if git(runner, repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{name}")], GIT_TIMEOUT).is_ok() {
+        bail!("branch {name} already exists in {repo}; --branch needs a new one");
+    }
+    Ok(name.to_string())
+}
+
+/// The branch of a worktree thread: the one it was started on (`--branch`, or
+/// recorded once herdr made it), else `hp/<slug>/<id>-<title>`.
+pub fn thread_branch(slug: &str, record: &Thread) -> String {
+    if record.branch.is_empty() {
+        thread::branch_name(slug, &record.id, &record.title)
+    } else {
+        record.branch.clone()
+    }
+}
+
 /// Steps 2 to 5 of starting a thread, also used by `thread restart` case (a).
 fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, restart: bool) -> Result<Thread> {
     let slug = &project.slug;
@@ -224,7 +275,7 @@ fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, r
             // through `--machine`.
             let target = remote::ssh_target(runner, &ctx.env.herdr_bin(), &ctx.config_dir, &record.machine)?;
             let (origin, base) = remote::repo_info(runner, &target, &record.repo, &record.base)?;
-            let branch = thread::branch_name(slug, id, &record.title);
+            let branch = thread_branch(slug, &record);
             let (created, path, cwd) = view.herdr.on_machine(&record.machine).worktree_create(&record.repo, &branch, &base, &record.title)?;
             thread::update(project, id, |t| {
                 t.origin = origin;
@@ -256,7 +307,7 @@ fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, r
             } else {
                 record.base.clone()
             };
-            let branch = thread::branch_name(slug, id, &record.title);
+            let branch = thread_branch(slug, &record);
             let (created, path, cwd) = view.herdr.worktree_create(&record.repo, &branch, &base, &record.title)?;
             let repo_workspace = repo_space(&view.herdr, &record.repo);
             // Recorded immediately, so a command killed midway still leaves a
@@ -483,7 +534,7 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
     let now = jiff::Timestamp::now();
     let live = thread::live_state(&record, &agents, &panes, now);
     let branch_exists = record.kind == Kind::Worktree && record.worktree_path.is_empty() && {
-        let branch = thread::branch_name(slug, id, &record.title);
+        let branch = thread_branch(slug, &record);
         if record.is_remote() {
             let target = remote::ssh_target(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, &record.machine)?;
             remote::branch_exists(ctx.runner, &target, &record.repo, &branch)?
@@ -858,15 +909,17 @@ pub fn clean(ctx: &Ctx, project: &Project, t: &Thread, options: &Clean) -> Vec<S
                 notes.push(format!("worktree kept at {}: not everything in it was copied home (`--discard-uncopied` removes it anyway)", t.worktree_path));
             } else {
                 match remove_worktree(ctx, project, t, view.as_ref()) {
-                    Ok(Removal::Removed) => {
+                    Ok(Removal::Removed(also)) => {
                         removed = true;
                         let _ = thread::update(project, &t.id, |t| t.worktree_path.clear());
                         notes.push(format!("worktree {} removed and its workspace closed", t.worktree_path));
+                        notes.extend(also.iter().map(also_closed));
                     }
-                    Ok(Removal::AlreadyGone(closed)) => {
+                    Ok(Removal::AlreadyGone(closed, also)) => {
                         removed = true;
                         let _ = thread::update(project, &t.id, |t| t.worktree_path.clear());
                         notes.push(format!("worktree {} was already gone; {closed}", t.worktree_path));
+                        notes.extend(also.iter().map(also_closed));
                     }
                     Err(error) => notes.push(format!("worktree kept at {}: {error:#}", t.worktree_path)),
                 }
@@ -994,9 +1047,70 @@ pub fn final_copy(ctx: &Ctx, project: &Project, record: &Thread) -> thread::Copi
 }
 
 pub enum Removal {
-    Removed,
-    /// The folder was gone before the removal; says what became of the workspace.
-    AlreadyGone(String),
+    /// Removed; the other Spaces open on it that were closed first.
+    Removed(Vec<Space>),
+    /// The folder was gone before the removal; says what became of the
+    /// workspace, and lists the other Spaces open on it that were closed.
+    AlreadyGone(String, Vec<Space>),
+}
+
+fn also_closed(space: &Space) -> String {
+    format!("also closed Space {} ({}) open on it", space.label, space.id)
+}
+
+/// The other Spaces herdr lists on a worktree, and the one to remove it through.
+pub struct OtherSpaces {
+    /// Closed before the removal.
+    pub closed: Vec<Space>,
+    /// The Space to run `herdr worktree remove --workspace` in: the given
+    /// one, or else the first other Space (which is then not closed on its own).
+    pub remover: Option<String>,
+}
+
+/// The linked-worktree Spaces herdr lists on the checkout at `path`, other
+/// than `except`, split into idle and in use (see `spaces::idle`). `None`
+/// when herdr cannot list its Spaces.
+fn spaces_on(view: &SessionView, path: &str, except: Option<&str>, include_focused: bool) -> Option<(Vec<Space>, Vec<Space>)> {
+    let workspaces = view.herdr.workspace_list().ok()?;
+    let (mut idle, mut busy) = (Vec::new(), Vec::new());
+    for w in crate::spaces::on_worktree(&workspaces, path).into_iter().filter(|w| Some(w.workspace_id.as_str()) != except) {
+        let space = Space { id: w.workspace_id.clone(), label: w.label.clone() };
+        if crate::spaces::idle(&view.herdr, &view.panes, &view.agents, w, include_focused) {
+            idle.push(space);
+        } else {
+            busy.push(space);
+        }
+    }
+    Some((idle, busy))
+}
+
+fn close_spaces(view: &SessionView, spaces: Vec<Space>) -> Result<Vec<Space>> {
+    for space in &spaces {
+        crate::spaces::close(&view.herdr, space).map_err(|error| anyhow::anyhow!("Space {} ({}) on it could not be closed ({error})", space.label, space.id))?;
+    }
+    Ok(spaces)
+}
+
+/// Closes every other Space herdr lists on the worktree at `path` (one
+/// `herdr worktree open` left there, the factory's for one), so none stays
+/// as an idle row once the worktree is gone. `except` is the Space the
+/// worktree will be removed through; with none, the first other Space takes
+/// that part. One in use keeps the worktree: nothing is closed and the error
+/// names it. Never `--group`. When herdr cannot list its Spaces, nothing
+/// is closed and `except` is the remover, as before.
+pub fn close_other_spaces(view: &SessionView, path: &str, except: Option<&str>, include_focused: bool) -> Result<OtherSpaces> {
+    let Some((mut idle, busy)) = spaces_on(view, path, except, include_focused) else {
+        return Ok(OtherSpaces { closed: Vec::new(), remover: except.map(str::to_string) });
+    };
+    if let Some(space) = busy.first() {
+        bail!("Space {} ({}) on it is still in use", space.label, space.id);
+    }
+    let remover = match except {
+        Some(id) => Some(id.to_string()),
+        None if !idle.is_empty() => Some(idle.remove(0).id),
+        None => None,
+    };
+    Ok(OtherSpaces { closed: close_spaces(view, idle)?, remover })
 }
 
 /// The thread's own workspace, when it is still open on its worktree. A pane
@@ -1014,7 +1128,8 @@ pub fn worktree_gone(record: &Thread) -> bool {
 /// Never forces. herdr's or git's refusal (for example uncommitted changes) is
 /// reported unchanged. An open workspace goes through `herdr worktree remove
 /// --workspace`, which also closes it (checked on 0.9.1). A worktree whose
-/// folder is already gone is pruned from git and its workspace closed.
+/// folder is already gone is pruned from git and its workspace closed. Other
+/// Spaces open on a local worktree are closed first (`close_other_spaces`).
 pub fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread, view: Option<&SessionView>) -> Result<Removal> {
     if record.worktree_path.is_empty() {
         bail!("{} has no recorded worktree", record.id);
@@ -1022,19 +1137,39 @@ pub fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread, view: Opti
     let _ = project;
     if worktree_gone(record) {
         let _ = git(ctx.runner, &record.repo, &["worktree", "prune"], GIT_TIMEOUT);
-        let closed = match view.and_then(|v| own_workspace(record, &v.panes).map(|w| (v, w))) {
+        let own = view.and_then(|v| own_workspace(record, &v.panes));
+        // Nothing is left to keep: the idle ones go, one in use stays.
+        let mut also = Vec::new();
+        if let Some(view) = view
+            && let Some((idle, _)) = spaces_on(view, &record.worktree_path, own.as_deref(), false)
+        {
+            for space in idle {
+                if crate::spaces::close(&view.herdr, &space).is_ok() {
+                    also.push(space);
+                }
+            }
+        }
+        let closed = match view.zip(own) {
             Some((view, workspace)) => match view.herdr.call(&["workspace", "close", &workspace], crate::herdr::CALL_TIMEOUT) {
                 Ok(_) => "its workspace closed".to_string(),
                 Err(error) => format!("its workspace {workspace} could not be closed ({error})"),
             },
             None => "no workspace was open on it".to_string(),
         };
-        return Ok(Removal::AlreadyGone(closed));
+        return Ok(Removal::AlreadyGone(closed, also));
     }
     if let Some(view) = view {
         let (_, panes) = lists_for(view, record)?;
-        if let Some(workspace) = own_workspace(record, &panes) {
-            return view.herdr.on_machine(&record.machine).worktree_remove(&workspace).map(|_| Removal::Removed).map_err(|error| anyhow::anyhow!("{error}"));
+        let own = own_workspace(record, &panes);
+        if record.is_remote() {
+            if let Some(workspace) = own {
+                return view.herdr.on_machine(&record.machine).worktree_remove(&workspace).map(|_| Removal::Removed(Vec::new())).map_err(|error| anyhow::anyhow!("{error}"));
+            }
+        } else {
+            let others = close_other_spaces(view, &record.worktree_path, own.as_deref(), false)?;
+            if let Some(workspace) = others.remover {
+                return view.herdr.worktree_remove(&workspace).map(|_| Removal::Removed(others.closed)).map_err(|error| anyhow::anyhow!("{error}"));
+            }
         }
     }
     if record.is_remote() {
@@ -1044,11 +1179,11 @@ pub fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread, view: Opti
         if !out.success() {
             bail!("{}", out.error_text());
         }
-        return Ok(Removal::Removed);
+        return Ok(Removal::Removed(Vec::new()));
     }
     git(ctx.runner, &record.repo, &["worktree", "remove", &record.worktree_path], Duration::from_secs(20))?;
     let _ = git(ctx.runner, &record.repo, &["worktree", "prune"], GIT_TIMEOUT);
-    Ok(Removal::Removed)
+    Ok(Removal::Removed(Vec::new()))
 }
 
 /// A thread with its live state and group, for `thread list`, `thread show`

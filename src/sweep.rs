@@ -4,6 +4,7 @@
 //! workspaces still open on a worktree that is gone, working
 //! folders of long-resolved tab threads, handled inbox items older than 30
 //! days, and empty repository Spaces herdr grouped their worktrees under.
+//! Other idle Spaces open on a removed worktree are closed with it.
 //! `--dry-run` lists; otherwise each is removed after a confirmation.
 //! Remote machines are left to `thread resolve`.
 
@@ -165,8 +166,15 @@ fn remove(ctx: &Ctx, project: &Project, orphan: &Orphan) -> Result<()> {
                     bail!("not everything in it could be copied home first");
                 }
             }
-            if let (Some(workspace), Some(view)) = (workspace, threads::session_view(ctx, project)) {
-                return view.herdr.worktree_remove(workspace).map_err(|e| anyhow::anyhow!("{e}"));
+            if let Some(view) = threads::session_view(ctx, project) {
+                // Sweep is confirmed: a focused but idle Space on it goes too.
+                let others = threads::close_other_spaces(&view, path, workspace.as_deref(), true)?;
+                for space in &others.closed {
+                    println!("closed Space {} ({}) open on {path}", space.label, space.id);
+                }
+                if let Some(remover) = others.remover {
+                    return view.herdr.worktree_remove(&remover).map_err(|e| anyhow::anyhow!("{e}"));
+                }
             }
             git(ctx, repo, &["worktree", "remove", path]).ok_or_else(|| anyhow::anyhow!("git refused to remove {path} (uncommitted changes?)"))?;
             let _ = git(ctx, repo, &["worktree", "prune"]);
