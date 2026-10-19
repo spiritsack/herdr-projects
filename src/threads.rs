@@ -76,9 +76,12 @@ pub struct StartArgs {
     /// it must be on the project's allow-list.
     pub profile: Option<String>,
     /// Placement (`--kind worktree|tab|checkout`); default worktree with a
-    /// repo, tab without one.
+    /// repo (`--repo`, or the project's only one), tab without one.
     pub kind: Option<Kind>,
     pub base: Option<String>,
+    /// The worktree's branch (`--branch`), default `hp/<slug>/<id>-<title>`.
+    /// Worktree threads only; it must not exist yet.
+    pub branch: Option<String>,
     pub task: String,
 }
 
@@ -148,13 +151,21 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         bail!("the task is empty");
     }
     let (settings, _) = project.read_project_md()?;
-    // Without a running ticker nothing launches.
-    ticker::start(ctx)?;
-    let view = require_session(ctx, &project)?;
 
-    let listed = args.repo.as_ref().and_then(|repo| settings.repos.iter().find(|r| &r.path == repo));
+    // Without --repo, a project with exactly one repo uses it, so the thread
+    // gets its own worktree. An explicit tab or checkout is left as asked, and
+    // so is a --machine the repo is not on.
+    let only_repo = match (&args.repo, settings.repos.as_slice(), args.kind) {
+        (None, [only], None | Some(Kind::Worktree)) if args.machine.is_none() || args.machine == only.machine => Some(only.path.clone()),
+        _ => None,
+    };
+    if let Some(path) = &only_repo {
+        eprintln!("note: no --repo given; using {path}, the project's only repo");
+    }
+    let requested_repo = args.repo.clone().or(only_repo);
+    let listed = requested_repo.as_ref().and_then(|repo| settings.repos.iter().find(|r| &r.path == repo));
     let machine = args.machine.clone().or_else(|| listed.and_then(|r| r.machine.clone())).unwrap_or_default();
-    let repo = match (&args.repo, machine.is_empty()) {
+    let repo = match (&requested_repo, machine.is_empty()) {
         (None, false) => bail!("a remote thread needs --repo: a task with no repository runs as a tab in the project's own workspace, which is local"),
         (None, true) => String::new(),
         // A remote path is stored as it is on its own machine.
@@ -173,6 +184,23 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     if !machine.is_empty() && listed.is_none() {
         eprintln!("warning: {repo} on {machine} is not listed in `repos` in PROJECT.md");
     }
+    let kind = placement(args.kind, !repo.is_empty(), !machine.is_empty())?;
+    let branch = match args.branch.as_deref() {
+        None => String::new(),
+        Some(_) if kind != Kind::Worktree => bail!("--branch is only for a worktree thread"),
+        Some(name) => {
+            if !machine.is_empty() {
+                // herdr on the thread's machine refuses a bad or taken branch.
+                name.to_string()
+            } else {
+                check_new_branch(ctx.runner, &repo, name)?
+            }
+        }
+    };
+
+    // Without a running ticker nothing launches.
+    ticker::start(ctx)?;
+    let view = require_session(ctx, &project)?;
 
     let open_count = thread::list(&project).iter().filter(|t| t.status == Status::Open || t.status == Status::Starting).count();
     if open_count as u32 >= settings.max_parallel_threads {
@@ -183,7 +211,6 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     }
 
     let profile = thread_profile(ctx, &project, &machine, args.profile.as_deref())?;
-    let kind = placement(args.kind, !repo.is_empty(), !machine.is_empty())?;
     let record = thread::allocate(&project, |t| {
         t.title = args.title.trim().to_string();
         t.kind = kind;
@@ -191,6 +218,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         t.machine = machine.clone();
         profile.apply(t);
         t.base = args.base.clone().unwrap_or_default();
+        t.branch = branch.clone();
     })?;
     let id = record.id.clone();
     {
@@ -212,6 +240,28 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     }
 }
 
+/// A `--branch` for a local worktree thread: a valid branch name that does not
+/// exist in `repo` yet. Each is one argument to git, never through a shell.
+fn check_new_branch(runner: &dyn Runner, repo: &str, name: &str) -> Result<String> {
+    if name.starts_with('-') || git(runner, repo, &["check-ref-format", "--branch", name], GIT_TIMEOUT).is_err() {
+        bail!("--branch {name} is not a valid branch name");
+    }
+    if git(runner, repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{name}")], GIT_TIMEOUT).is_ok() {
+        bail!("branch {name} already exists in {repo}; --branch needs a new one");
+    }
+    Ok(name.to_string())
+}
+
+/// The branch of a worktree thread: the one it was started on (`--branch`, or
+/// recorded once herdr made it), else `hp/<slug>/<id>-<title>`.
+pub fn thread_branch(slug: &str, record: &Thread) -> String {
+    if record.branch.is_empty() {
+        thread::branch_name(slug, &record.id, &record.title)
+    } else {
+        record.branch.clone()
+    }
+}
+
 /// Steps 2 to 5 of starting a thread, also used by `thread restart` case (a).
 fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, restart: bool) -> Result<Thread> {
     let slug = &project.slug;
@@ -224,7 +274,7 @@ fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, r
             // through `--machine`.
             let target = remote::ssh_target(runner, &ctx.env.herdr_bin(), &ctx.config_dir, &record.machine)?;
             let (origin, base) = remote::repo_info(runner, &target, &record.repo, &record.base)?;
-            let branch = thread::branch_name(slug, id, &record.title);
+            let branch = thread_branch(slug, &record);
             let (created, path, cwd) = view.herdr.on_machine(&record.machine).worktree_create(&record.repo, &branch, &base, &record.title)?;
             thread::update(project, id, |t| {
                 t.origin = origin;
@@ -256,7 +306,7 @@ fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, r
             } else {
                 record.base.clone()
             };
-            let branch = thread::branch_name(slug, id, &record.title);
+            let branch = thread_branch(slug, &record);
             let (created, path, cwd) = view.herdr.worktree_create(&record.repo, &branch, &base, &record.title)?;
             let repo_workspace = repo_space(&view.herdr, &record.repo);
             // Recorded immediately, so a command killed midway still leaves a
@@ -483,7 +533,7 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
     let now = jiff::Timestamp::now();
     let live = thread::live_state(&record, &agents, &panes, now);
     let branch_exists = record.kind == Kind::Worktree && record.worktree_path.is_empty() && {
-        let branch = thread::branch_name(slug, id, &record.title);
+        let branch = thread_branch(slug, &record);
         if record.is_remote() {
             let target = remote::ssh_target(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, &record.machine)?;
             remote::branch_exists(ctx.runner, &target, &record.repo, &branch)?

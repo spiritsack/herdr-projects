@@ -327,7 +327,7 @@ enum CoordinatorCommand {
 
 #[derive(Subcommand)]
 enum ThreadCommand {
-    /// Start a thread: a worktree workspace for --repo, else a tab in the project workspace
+    /// Start a thread: a worktree workspace for --repo, or the project's only repo; else a tab in the project workspace
     Start {
         slug: String,
         #[arg(long)]
@@ -339,11 +339,14 @@ enum ThreadCommand {
         /// The agent's profile (harness, model, effort, flags), one the project allows (default: thread_profile in PROJECT.md); `context` lists them
         #[arg(long, alias = "agent", value_name = "NAME")]
         profile: Option<String>,
-        /// Placement, not the agent: worktree (default with --repo), tab (default without), or checkout (a tab on the repo's main checkout)
+        /// Placement, not the agent: worktree (default with --repo, or the project's only repo), tab (default without), or checkout (a tab on the repo's main checkout)
         #[arg(long, value_name = "worktree|tab|checkout")]
         kind: Option<String>,
         #[arg(long, value_name = "REF")]
         base: Option<String>,
+        /// The worktree's branch, a new one (default: hp/<project>/<id>-<title>); worktree threads only
+        #[arg(long, value_name = "NAME")]
+        branch: Option<String>,
         /// The task; `-` reads standard input
         #[arg(long, value_name = "FILE")]
         task_file: String,
@@ -711,7 +714,7 @@ pub fn run() -> Result<()> {
             }
         },
         Command::Thread { command } => match command {
-            ThreadCommand::Start { slug, title, repo, mut machine, mut profile, kind, base, task_file, from_task } => {
+            ThreadCommand::Start { slug, title, repo, mut machine, mut profile, kind, base, branch, task_file, from_task } => {
                 let mut task = read_text(&task_file)?;
                 if let Some(from) = from_task {
                     // The task's owner picks the profile and machine.
@@ -726,7 +729,7 @@ pub fn run() -> Result<()> {
                     task = crate::tasks::delegated(&tasks_md, &from, &task)?;
                 }
                 let kind = kind.as_deref().map(crate::thread::Kind::parse).transpose()?;
-                let thread = threads::start(&ctx, &slug, StartArgs { title, repo, machine, profile, kind, base, task })?;
+                let thread = threads::start(&ctx, &slug, StartArgs { title, repo, machine, profile, kind, base, branch, task })?;
                 println!("{}", serde_json::json!({ "id": thread.id, "kind": thread.kind, "profile": thread.profile, "agent": thread.agent, "branch": thread.branch, "pane_id": thread.pane_id }));
                 Ok(())
             }
