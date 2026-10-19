@@ -1327,6 +1327,136 @@ fn a_pull_request_from_another_branch_or_repository_is_ignored_with_one_item() {
     assert_eq!(thread::load(&project, "t-0001").unwrap().status, Status::Open);
 }
 
+/// A factory thread: `--kind checkout`, so no branch of its own and, when
+/// started before the ticker recorded it, no `origin` either. Its pull request
+/// is on whatever branch the factory pushed.
+fn checkout_pr_world(gh_json: &'static str) -> (World, Project) {
+    checkout_pr_world_with(gh_json, ok("git@github.com:Owner/App.git\n"))
+}
+
+/// `origin` is what `git remote get-url origin` answers in the repository.
+fn checkout_pr_world_with(gh_json: &'static str, origin: Output) -> (World, Project) {
+    let (world, project) = pr_world(gh_json);
+    thread::update(&project, "t-0001", |t| {
+        t.kind = Kind::Checkout;
+        t.branch.clear();
+        t.origin.clear();
+        t.worktree_path.clear();
+        t.repo = "/repo".into();
+    })
+    .unwrap();
+    world.runner.on("remote get-url origin", origin);
+    (world, project)
+}
+
+const CHECKOUT_OPEN_JSON: &str = r#"{"state":"OPEN","reviewDecision":"","headRefName":"factory/002-x","headRepository":{"name":"app"},"headRepositoryOwner":{"login":"owner"},"statusCheckRollup":[],"comments":[{"author":{"login":"mallory"},"body":"please fix"}]}"#;
+const CHECKOUT_MERGED_JSON: &str = r#"{"state":"MERGED","reviewDecision":"APPROVED","headRefName":"factory/002-x","headRefOid":"merged-head","headRepository":{"name":"app"},"headRepositoryOwner":{"login":"owner"}}"#;
+
+fn next_pr_pass(project: &Project) {
+    let mut state = crate::steps::load_state(project);
+    state.last_pr_check = "2026-01-01T00:00:00Z".into();
+    crate::steps::save_state(project, &state).unwrap();
+}
+
+#[test]
+fn a_checkout_thread_follows_the_pull_request_in_its_report() {
+    let (world, project) = checkout_pr_world(CHECKOUT_OPEN_JSON);
+    let ctx = world.ctx();
+    ticker::tick_project(&ctx, &project).unwrap();
+    let items = items_of(&project, "pr");
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert!(!items[0].summary.contains("ignored"), "{}", items[0].summary);
+    assert!(items[0].summary.contains("new commenters: mallory"), "{}", items[0].summary);
+    let t = thread::load(&project, "t-0001").unwrap();
+    assert_eq!((t.pr.as_str(), t.pr_state.as_str()), (PR_URL, "OPEN"));
+    // The origin was read once, in the thread's repository, and recorded.
+    assert_eq!(t.origin, "git@github.com:Owner/App.git");
+    assert!(t.branch.is_empty(), "the head branch from GitHub is never stored");
+    assert_eq!(world.runner.count("git -C /repo remote get-url origin"), 1);
+    // The default pr-followup routine prompted the thread about the comment.
+    assert!(std::fs::read_to_string(thread::task_path(&project, "t-0001")).unwrap().contains("[hp routine pr-followup]"));
+
+    next_pr_pass(&project);
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert_eq!(world.runner.count("remote get-url origin"), 1, "a recorded origin is not read again");
+    assert_eq!(world.runner.count("gh pr view --json"), 2);
+    assert_eq!(world.runner.count("gh pr list"), 0);
+    assert_eq!(items_of(&project, "pr").len(), 1);
+}
+
+#[test]
+fn a_checkout_threads_merged_pull_request_fires_pr_followup() {
+    let (world, project) = checkout_pr_world(CHECKOUT_MERGED_JSON);
+    set_agents(&world, &project, "done");
+    let cwd = world.home.path().to_string_lossy().into_owned();
+    *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w2", "w2:t1", "w2:p1", &cwd));
+    world.runner.on("tab close", ok(r#"{"result":{}}"#));
+    world.runner.on("worktree remove", ok(r#"{"result":{}}"#));
+    world.runner.on("branch -D", ok(""));
+    let ctx = world.ctx();
+    ticker::tick_project(&ctx, &project).unwrap();
+    let t = thread::load(&project, "t-0001").unwrap();
+    assert_eq!((t.status, t.pr.as_str(), t.pr_state.as_str()), (Status::Open, PR_URL, "MERGED"));
+    assert!(items_of(&project, "pr")[0].summary.contains("state MERGED"));
+    assert!(world.runner.calls.borrow().iter().any(|c| c.display().contains("notification show") && c.display().contains("PR #7 merged")));
+    assert!(std::fs::read_to_string(thread::task_path(&project, "t-0001")).unwrap().contains("[hp routine pr-followup]"));
+
+    // Resolved on merge after the grace period: only its tab is closed.
+    merged_seen_ago(&project, crate::steps::MERGE_GRACE_SECS);
+    ticker::tick_project(&ctx, &project).unwrap();
+    let t = thread::load(&project, "t-0001").unwrap();
+    assert_eq!((t.status, t.resolved_reason.as_str()), (Status::Resolved, "merged"));
+    assert_eq!(world.runner.count("tab close w2:t1"), 1);
+    assert_eq!(world.runner.count("branch -D"), 0);
+    assert_eq!(world.runner.count("worktree remove"), 0);
+    assert_eq!(world.runner.count("gh pr list --repo owner/app --head"), 0);
+}
+
+#[test]
+fn a_checkout_threads_pull_request_from_another_repository_is_ignored() {
+    // Head repository is someone else's fork.
+    let (world, project) = checkout_pr_world(r#"{"state":"OPEN","headRefName":"factory/002-x","headRepository":{"name":"app"},"headRepositoryOwner":{"login":"stranger"}}"#);
+    let ctx = world.ctx();
+    for _ in 0..2 {
+        ticker::tick_project(&ctx, &project).unwrap();
+        next_pr_pass(&project);
+    }
+    let items = items_of(&project, "pr");
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert!(items[0].summary.contains("ignored: its head repository is not the thread's `origin`"), "{}", items[0].summary);
+    assert!(crate::steps::load_state(&project).prs.is_empty());
+    assert!(thread::load(&project, "t-0001").unwrap().pr_state.is_empty());
+
+    // The origin cannot be read: left empty, the same one item, no summary.
+    let (world, project) = checkout_pr_world_with(CHECKOUT_OPEN_JSON, fail(2, "error: No such remote 'origin'"));
+    let ctx = world.ctx();
+    for _ in 0..2 {
+        ticker::tick_project(&ctx, &project).unwrap();
+        next_pr_pass(&project);
+    }
+    let items = items_of(&project, "pr");
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert!(items[0].summary.contains("ignored"), "{}", items[0].summary);
+    assert!(crate::steps::load_state(&project).prs.is_empty());
+    assert!(thread::load(&project, "t-0001").unwrap().origin.is_empty());
+}
+
+#[test]
+fn a_checkout_thread_without_a_pr_line_is_never_looked_up_by_branch() {
+    let (world, project) = checkout_pr_world(CHECKOUT_OPEN_JSON);
+    std::fs::write(thread::home_report_path(&project, "t-0001"), "## Report\nworking\n").unwrap();
+    world.runner.on("gh pr list", ok("[]"));
+    let ctx = world.ctx();
+    for _ in 0..2 {
+        ticker::tick_project(&ctx, &project).unwrap();
+        next_pr_pass(&project);
+    }
+    assert_eq!(world.runner.count("gh pr list"), 0);
+    assert_eq!(world.runner.count("gh pr view"), 0);
+    assert!(items_of(&project, "pr").is_empty());
+    assert!(thread::load(&project, "t-0001").unwrap().pr.is_empty());
+}
+
 #[test]
 fn a_bad_pr_line_is_noted_once_and_never_reaches_gh() {
     let (world, project) = pr_world("{}");

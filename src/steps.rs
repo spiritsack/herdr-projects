@@ -422,9 +422,20 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
     }
     state.last_pr_check = now.to_string();
 
-    for t in thread::list(project) {
+    for mut t in thread::list(project) {
         if t.status != Status::Open {
             continue;
+        }
+        // A checkout thread is started without its `origin` (it has no branch
+        // of its own); record it now, so its pull request can be matched.
+        if t.kind == thread::Kind::Checkout && t.origin.is_empty() && !t.repo.is_empty() {
+            let cmd = crate::runner::Cmd::new("git", std::time::Duration::from_secs(5)).args(["-C", t.repo.as_str(), "remote", "get-url", "origin"]);
+            let origin = ctx.runner.run(&cmd).ok().filter(|out| out.success()).map(|out| out.stdout.trim().to_string()).unwrap_or_default();
+            if !origin.is_empty() {
+                let stored = origin.clone();
+                errors.extend(thread::update(project, &t.id, |t| t.origin = stored).err());
+                t.origin = origin;
+            }
         }
         // The `PR:` line of the home copy of the report.
         let report = std::fs::read_to_string(thread::home_report_path(project, &t.id)).unwrap_or_default();
@@ -475,7 +486,10 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
                 continue;
             }
         };
-        match pr::reduce(&json, &t.branch, &t.origin) {
+        // A checkout thread has no branch of its own: it follows the pull
+        // request its report names, on any head branch of `origin`.
+        let branch = if t.kind == thread::Kind::Checkout { None } else { Some(t.branch.as_str()) };
+        match pr::reduce(&json, branch, &t.origin) {
             Err(error) => errors.push(error.context(format!("{}: gh output", t.id))),
             Ok(pr::Checked::Ignored(reason)) => {
                 if state.pr_ignored.get(&t.id) != Some(&url) {
